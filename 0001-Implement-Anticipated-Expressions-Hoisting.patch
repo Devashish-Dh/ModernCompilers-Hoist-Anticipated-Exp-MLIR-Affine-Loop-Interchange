@@ -1,0 +1,1101 @@
+From 1671eec0e2afe79b3e487d973e0e95a2d2a16f00 Mon Sep 17 00:00:00 2001
+From: Devashish-Dh <devashish.dhaulakhandi@gmail.com>
+Date: Sun, 1 Mar 2026 02:33:45 +0530
+Subject: [PATCH] Implement Anticipated Expressions Hoisting
+
+---
+ .../Utils/HoistAnticipatedExpPassASSG.h       |   20 +
+ llvm/lib/Passes/PassBuilder.cpp               |    1 +
+ llvm/lib/Passes/PassRegistry.def              |    1 +
+ llvm/lib/Transforms/Utils/CMakeLists.txt      |    1 +
+ .../Utils/HoistAnticipatedExpPassASSG.cpp     | 1015 +++++++++++++++++
+ 5 files changed, 1038 insertions(+)
+ create mode 100644 llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpPassASSG.h
+ create mode 100644 llvm/lib/Transforms/Utils/HoistAnticipatedExpPassASSG.cpp
+
+diff --git a/llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpPassASSG.h b/llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpPassASSG.h
+new file mode 100644
+index 000000000000..4b48e5734129
+--- /dev/null
++++ b/llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpPassASSG.h
+@@ -0,0 +1,20 @@
++//===-- HoistAnticipatedExpPassASSG.h - Hoist Anticipated Expressions Pass
++//implemented for Compilers assignment - C++ -*-===//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_TRANSFORMS_UTILS_ANTICIPATEDEXPPASSASSG_H
++#define LLVM_TRANSFORMS_UTILS_ANTICIPATEDEXPPASSASSG_H
++
++#include "llvm/IR/PassManager.h"
++
++namespace llvm {
++
++class HoistAnticipatedExpPassASSG
++    : public PassInfoMixin<HoistAnticipatedExpPassASSG> {
++public:
++  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
++};
++
++} // namespace llvm
++
++#endif // LLVM_TRANSFORMS_UTILS_ANTICIPATEDEXPPASSASSG_H
+diff --git a/llvm/lib/Passes/PassBuilder.cpp b/llvm/lib/Passes/PassBuilder.cpp
+index 75a8c8df0eff..5b2850c28bfd 100644
+--- a/llvm/lib/Passes/PassBuilder.cpp
++++ b/llvm/lib/Passes/PassBuilder.cpp
+@@ -347,6 +347,7 @@
+ #include "llvm/Transforms/Utils/EntryExitInstrumenter.h"
+ #include "llvm/Transforms/Utils/FixIrreducible.h"
+ #include "llvm/Transforms/Utils/HelloWorld.h"
++#include "llvm/Transforms/Utils/HoistAnticipatedExpPassASSG.h" // Pass implemented for the assignment
+ #include "llvm/Transforms/Utils/IRNormalizer.h"
+ #include "llvm/Transforms/Utils/InjectTLIMappings.h"
+ #include "llvm/Transforms/Utils/InstructionNamer.h"
+diff --git a/llvm/lib/Passes/PassRegistry.def b/llvm/lib/Passes/PassRegistry.def
+index 9a943155aa19..23e27d2bb830 100644
+--- a/llvm/lib/Passes/PassRegistry.def
++++ b/llvm/lib/Passes/PassRegistry.def
+@@ -439,6 +439,7 @@ FUNCTION_PASS("guard-widening", GuardWideningPass())
+ FUNCTION_PASS("gvn-hoist", GVNHoistPass())
+ FUNCTION_PASS("gvn-sink", GVNSinkPass())
+ FUNCTION_PASS("helloworld", HelloWorldPass())
++FUNCTION_PASS("hoist-anticipated-expressions", HoistAnticipatedExpPassASSG()) // Pass implemented for compilers assignment
+ FUNCTION_PASS("indirectbr-expand", IndirectBrExpandPass(TM))
+ FUNCTION_PASS("infer-address-spaces", InferAddressSpacesPass())
+ FUNCTION_PASS("infer-alignment", InferAlignmentPass())
+diff --git a/llvm/lib/Transforms/Utils/CMakeLists.txt b/llvm/lib/Transforms/Utils/CMakeLists.txt
+index f7e66eca6aeb..66bf319bb3e4 100644
+--- a/llvm/lib/Transforms/Utils/CMakeLists.txt
++++ b/llvm/lib/Transforms/Utils/CMakeLists.txt
+@@ -33,6 +33,7 @@ add_llvm_component_library(LLVMTransformUtils
+   GlobalStatus.cpp
+   GuardUtils.cpp
+   HelloWorld.cpp
++  HoistAnticipatedExpPassASSG.cpp # Pass implemented for compilers assignment.
+   InlineFunction.cpp
+   InjectTLIMappings.cpp
+   InstructionNamer.cpp
+diff --git a/llvm/lib/Transforms/Utils/HoistAnticipatedExpPassASSG.cpp b/llvm/lib/Transforms/Utils/HoistAnticipatedExpPassASSG.cpp
+new file mode 100644
+index 000000000000..47a6ccf81742
+--- /dev/null
++++ b/llvm/lib/Transforms/Utils/HoistAnticipatedExpPassASSG.cpp
+@@ -0,0 +1,1015 @@
++//===----------------------------------------------------------------------===//
++//
++// Hoist Anticipated Expressions Pass : Devashish Dhaulakhandi 27231
++//
++//===----------------------------------------------------------------------===//
++///
++/// \file
++/// Implementation of Local Common Subexpression Elimination combined with
++/// Anticipated Expressions analysis and Loop Invariant Code Motion (LICM).
++/// The pass hoists redundant expressions to dominating blocks and loop
++/// preheaders when safety and dominance constraints are satisfied. Detailed
++/// debug output is controlled via the -dump-sets command-line flag.
++//===----------------------------------------------------------------------===//
++
++#include "llvm/Transforms/Utils/HoistAnticipatedExpPassASSG.h"
++
++#include "llvm/ADT/BitVector.h"
++#include "llvm/ADT/DenseMapInfo.h"
++#include "llvm/ADT/DenseSet.h"
++#include "llvm/ADT/DepthFirstIterator.h"
++#include "llvm/ADT/Hashing.h"
++#include "llvm/ADT/MapVector.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/Twine.h"
++
++#include "llvm/Analysis/LoopInfo.h"
++#include "llvm/Analysis/ValueTracking.h"
++
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/CFG.h"
++#include "llvm/IR/Dominators.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/Instruction.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/Operator.h"
++#include "llvm/IR/Type.h"
++
++#include "llvm/Support/Casting.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/raw_ostream.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "hoist-anticipated-expressions"
++
++// Defining a custom flag
++static llvm::cl::opt<bool> DumpSets(
++    "dump-sets",
++    llvm::cl::desc("Output the Anticipated Expression IN and OUT sets"),
++    llvm::cl::init(false), llvm::cl::Hidden);
++
++namespace {
++// This pass hoists binary operators, casts, comparisons, GEPs, and function
++// calls when they satisfy safety and dominance constraints. Commutativity for
++// compares and others is handled via canonical operand ordering.
++
++/// Determines if an instruction is supported for hoisting.
++bool isSupportedInstruction(llvm::Instruction *Instr) {
++
++  if (Instr->getType()->isVoidTy()) {
++    if (DumpSets)
++      errs() << "[SUPPORT_INSTR-DEBUG] *" << *Instr
++             << ": REJECTED (void type)\n";
++    return false; // Void-type instructions produce no value.
++  }
++
++  if (Instr->isTerminator()) {
++    if (DumpSets)
++      errs() << "[SUPPORT_INSTR-DEBUG] *" << *Instr
++             << ": REJECTED (terminator)\n";
++    return false; // Terminators cannot be hoisted.
++  }
++
++  if (isa<AllocaInst>(Instr) || isa<PHINode>(Instr) ||
++      isa<LandingPadInst>(Instr) || isa<SelectInst>(Instr)) {
++    if (DumpSets)
++      errs() << "[SUPPORT_INSTR-DEBUG] *" << *Instr
++             << ": REJECTED (alloca/phi/landing/select)\n";
++    return false; // These instructions have special semantics and out of scope
++                  // for this pass.
++  }
++
++  if (auto *CI = dyn_cast<CallInst>(Instr)) {
++    if (CI->isIndirectCall()) {
++      if (DumpSets)
++        errs() << "[SUPPORT_INSTR-DEBUG] *" << *Instr
++               << ": REJECTED (indirect call)\n";
++      return false;
++    }
++    if (CI->doesNotReturn()) {
++      if (DumpSets)
++        errs() << "[SUPPORT_INSTR-DEBUG] *" << *Instr
++               << ": REJECTED (doesNotReturn)\n";
++      return false;
++    }
++  }
++
++  // No memory modifying instructions are supported.
++  // For calls, mayWriteToMemory() is conservative - check attributes instead
++  if (auto *CI = dyn_cast<CallInst>(Instr)) {
++    // For calls, check if it actually accesses memory based on attributes
++    if (!CI->doesNotAccessMemory() && !CI->onlyReadsMemory()) {
++      if (DumpSets)
++        errs() << "[SUPPORT_INSTR-DEBUG] *" << *Instr
++               << ": REJECTED (writes memory)\n";
++      return false;
++    }
++    // If it only reads or doesn't access memory, allow it to pass
++  } else {
++    // For non-calls, use mayWriteToMemory
++    if (Instr->mayWriteToMemory()) {
++      if (DumpSets)
++        errs() << "[SUPPORT_INSTR-DEBUG] *" << *Instr
++               << ": REJECTED (mayWriteToMemory)\n";
++      return false;
++    }
++  }
++
++  // Safety is verified during the hoisting phase, not here.
++
++  // Explicitly check for supported instruction types.
++  if (llvm::isa<llvm::BinaryOperator>(Instr) ||
++      llvm::isa<llvm::CastInst>(Instr) || llvm::isa<llvm::CmpInst>(Instr) ||
++      llvm::isa<llvm::GetElementPtrInst>(Instr) ||
++      llvm::isa<llvm::CallInst>(Instr) ||
++      llvm::isa<llvm::UnaryOperator>(Instr) ||
++      llvm::isa<llvm::SelectInst>(Instr)) {
++    if (DumpSets)
++      errs() << "[SUPPORT_INSTR-DEBUG] *" << *Instr << ": ACCEPTED\n";
++    return true;
++  }
++  if (DumpSets)
++    errs() << "[SUPPORT_INSTR-DEBUG] *" << *Instr
++           << ": REJECTED (unsupported type)\n";
++  return false; // Skip unsupported instruction types.
++}
++
++// Struct Key for the hash map [Expression -> Key]
++struct ExpressionAsKey {
++  unsigned Opcode = 0;
++  llvm::Type *InstrType = nullptr;
++  llvm::SmallVector<llvm::Value *, 2> Operands;
++  unsigned Predicate = 0; // Stores comparison predicate for CmpInst.
++
++  // Overflow and other flags must be preserved for correctness.
++  bool HasNUW = false;
++  bool HasNSW = false;
++  bool IsExact = false;
++  bool IsInBounds = false;
++
++  llvm::FastMathFlags FMF =
++      llvm::FastMathFlags(); // Fast-math flags for FP operations.
++  const llvm::Function *CalledFunction =
++      nullptr; // Target function for call expressions.
++};
++
++/// Converts an instruction into a hashable expression key.
++/// Precondition: isSupportedInstruction() must return true for the given
++/// instruction.
++bool convertInstructionToExpressionAsKey(llvm::Instruction *Instr,
++                                         ExpressionAsKey &Key) {
++
++  Key = ExpressionAsKey(); // Initialize key structure.
++
++  Key.Opcode = Instr->getOpcode();
++  Key.InstrType = Instr->getType();
++
++  // Extract instruction-specific flags that affect equivalence.
++  if (auto *BO = dyn_cast<BinaryOperator>(Instr)) {
++    Key.HasNUW = BO->hasNoUnsignedWrap();
++    Key.HasNSW = BO->hasNoSignedWrap();
++    Key.IsExact = BO->isExact();
++  } else if (auto *GEP = dyn_cast<GetElementPtrInst>(Instr)) {
++    Key.IsInBounds = GEP->isInBounds();
++  }
++  // To capture FastMath (Floating Point)
++  if (auto *FPMO = llvm::dyn_cast<llvm::FPMathOperator>(Instr)) {
++    Key.FMF = FPMO->getFastMathFlags();
++  }
++
++  // Now to handle operands
++  if (auto *CI = llvm::dyn_cast<CallInst>(Instr)) {
++    Key.CalledFunction = CI->getCalledFunction();
++    for (auto &Arg : CI->args()) {
++      Key.Operands.push_back(Arg.get());
++    }
++  } else {
++    for (llvm::Value *Op : Instr->operands()) {
++      // For non-call instructions, operands are obtained directly.
++      Key.Operands.push_back(Op);
++    }
++  }
++  // Canonical form: ensure operands are in consistent order for commutative
++  // operations.
++  if (auto *Cmp = llvm::dyn_cast<llvm::CmpInst>(Instr)) {
++    Key.Predicate = Cmp->getPredicate();
++    // Sort operands by pointer value for consistent canonical form.
++    if (Key.Operands[0] > Key.Operands[1]) {
++      std::swap(Key.Operands[0], Key.Operands[1]);
++      Key.Predicate = Cmp->getSwappedPredicate();
++    }
++  } else {
++    Key.Predicate = 0; // Non-compare instructions have no predicate.
++    // For commutative binary operations, establish canonical form.
++    if (Instr->isCommutative() && Key.Operands.size() == 2) {
++      if (Key.Operands[0] > Key.Operands[1]) {
++        std::swap(Key.Operands[0], Key.Operands[1]);
++      }
++    }
++  }
++
++  return true; // Successfully converted instruction to key.
++}
++
++/// Eliminates redundant expressions within a single basic block (local CSE).
++/// Function calls are not handled here due to correctness constraints.
++bool runLocalCSE(llvm::BasicBlock &BB) {
++  DenseMap<ExpressionAsKey, Value *, DenseMapInfo<ExpressionAsKey>>
++      ExpressionsMap;
++  bool Changed = false;
++
++  for (auto InstIt = BB.begin(), E = BB.end(); InstIt != E;) {
++    Instruction *Instr = &*InstIt++;
++    if (!isSupportedInstruction(Instr))
++      continue;
++
++    ExpressionAsKey Key;
++    convertInstructionToExpressionAsKey(Instr, Key);
++
++    // If an identical expression already exists, replace this one with that.
++    if (Value *Existing = ExpressionsMap.lookup(Key)) {
++      // Reuse the existing instruction.
++      if (DumpSets) {
++        errs() << "[LCSE] Replacing: " << *Instr << "  with: " << *Existing
++               << "\n";
++      }
++      Instr->replaceAllUsesWith(Existing);
++      Instr->eraseFromParent();
++
++      Changed = true;
++    } else {
++      // Record first occurrence of this expression.
++      ExpressionsMap[Key] = Instr;
++    }
++  }
++
++  return Changed;
++} // Remember that SSA has NO redefinitions of values / variables.
++
++} // end of anonymous namespace
++
++namespace llvm {
++
++// DenseMapInfo specialization
++template <> struct DenseMapInfo<ExpressionAsKey> {
++  static inline ExpressionAsKey getEmptyKey() {
++    ExpressionAsKey Key;
++    Key.Opcode = ~0u; // all 1s to mark empty
++    Key.InstrType = nullptr;
++    return Key;
++  }
++
++  static inline ExpressionAsKey getTombstoneKey() {
++    ExpressionAsKey Key;
++    Key.Opcode = ~0u - 1; // distinct from empty
++    Key.InstrType = nullptr;
++    return Key;
++  }
++
++  static unsigned getHashValue(const ExpressionAsKey &K) {
++    if (K.Opcode == ~0u || K.Opcode == ~0u - 1) {
++      return K
++          .Opcode; // Use the Opcode as the hash for empty and tombstone keys.
++    }
++    unsigned H =
++        hash_combine(K.Opcode, K.InstrType, K.Predicate, K.FMF.any(), K.HasNUW,
++                     K.HasNSW, K.IsExact, K.IsInBounds, K.CalledFunction);
++    for (llvm::Value *Op : K.Operands) {
++      H = hash_combine(H, Op);
++    }
++    return H;
++  }
++
++  static bool isEqual(const ExpressionAsKey &LHS, const ExpressionAsKey &RHS) {
++    if (LHS.Opcode == ~0u || LHS.Opcode == ~0u - 1 || RHS.Opcode == ~0u ||
++        RHS.Opcode == ~0u - 1) {
++      return LHS.Opcode ==
++             RHS.Opcode; // Special marker values are only equal to themselves.
++    }
++
++    if (LHS.Opcode != RHS.Opcode)
++      return false;
++    if (LHS.InstrType != RHS.InstrType)
++      return false;
++    if (LHS.Predicate != RHS.Predicate)
++      return false;
++    if (LHS.FMF != RHS.FMF)
++      return false;
++    if (LHS.HasNUW != RHS.HasNUW)
++      return false;
++    if (LHS.HasNSW != RHS.HasNSW)
++      return false;
++    if (LHS.IsExact != RHS.IsExact)
++      return false;
++    if (LHS.IsInBounds != RHS.IsInBounds)
++      return false;
++    if (LHS.CalledFunction != RHS.CalledFunction)
++      return false;
++    if (LHS.Operands != RHS.Operands)
++      return false;
++
++    return true;
++  }
++};
++
++} // namespace llvm
++
++/// Main entry point for the hoist anticipated expressions pass.
++/// Performs local CSE ONCE
++/// Performs anticipated expression analysis, and LICM in a loop.
++PreservedAnalyses
++HoistAnticipatedExpPassASSG::run(Function &F, FunctionAnalysisManager &AM) {
++
++  if (DumpSets) {
++    errs() << "[HoistAnticipatedExpPassASSG] [Local CSE] running on function: "
++           << F.getName() << "\n\n";
++  }
++
++  assert(!F.empty() && "Cannot run on an empty function");
++
++  bool AnyChanged = false;
++  for (auto &BB : F) {
++    if (runLocalCSE(BB))
++      AnyChanged = true;
++  }
++
++  if (AnyChanged) {
++    if (DumpSets) {
++      errs() << "[HoistAnticipatedExpPassASSG] [Local CSE] function "
++             << F.getName() << " changed\n\n";
++    }
++  }
++
++  // RUN PIPELINE TILL NO MORE CHANGES LEFT :
++  // Anticipated Expressions Analysis -> Hoisting
++  // (repeat if hoisting changed IR since it can open up new CSE opportunities
++  // and change the anticipated expressions)
++
++  bool PipelineChangedInIter = false; // indicator var for the pipeline
++  unsigned PipelineIter = 0;
++  const unsigned MaxPipelineIters = 50;
++
++  do {
++    PipelineChangedInIter = false;
++
++    if (DumpSets) {
++      errs() << "\n\n========================[HoistAnticipatedExpPassASSG] "
++                "[Pipeline] Iteration "
++             << (PipelineIter + 1) << "========================\n\n";
++    }
++
++    // Implementation of the Anticipated Expressions Dataflow Analysis :
++    // Build universe of expressions and operand-to-expression mapping.
++
++    MapVector<ExpressionAsKey, unsigned>
++        ExpressionsUniverse; // Maps expressions to unique IDs. //
++                             // ExpressionAsKey->ExprID
++
++    SmallVector<ExpressionAsKey>
++        ExpressionIDToKey; // Maps expression IDs to their keys.        //
++                           // ExprID->ExpressionAsKey
++
++    DenseMap<Instruction *, unsigned>
++        InstrToExprID; // Maps instructions to expression IDs.     //
++                       // Instruction->ExprID
++
++    DenseMap<unsigned, SmallVector<Instruction *>>
++        ExprIDToInstructions; // Maps expression IDs to all matching
++                              // instructions.
++    // ExprID-> [Instruction1, Instruction2, ...] (all instructions in the IR
++    // that match this expression ID)
++
++    DenseMap<Value *, SmallVector<unsigned, 4>>
++        ValueToExpressions; // Maps operand values to expression IDs that use
++                            // them.
++    // Operand Value -> [ExprID1, ExprID2, ...] (all expression IDs that use
++    // this operand value in their expression key)
++
++    unsigned NextId = 0; // Counter for assigning unique indices to expressions.
++
++    // Traverse all instructions in the function to build the Universe of
++    // Expressions and the ValueToExpressions map.
++    for (auto &BB : F) {
++      for (auto &Instr : BB) {
++        if (!isSupportedInstruction(&Instr))
++          continue;
++
++        ExpressionAsKey Key;
++        if (convertInstructionToExpressionAsKey(&Instr, Key)) {
++          auto Result = ExpressionsUniverse.insert({Key, NextId});
++          // Update mapping for expression to ID if it's a new expression,
++          // otherwise get existing ID update ValueToExpressions for each
++          // operand in the expression key update reverse mapping from
++          // expression ID to all instructions that match it update mapping from
++          // instruction to expression ID
++          unsigned ExprID = Result.first->second;
++          if (Result.second) {
++            for (Value *Op : Key.Operands) {
++              ValueToExpressions[Op].push_back(NextId);
++            }
++            ExpressionIDToKey.push_back(Key);
++            ++NextId;
++          }
++
++          InstrToExprID[&Instr] = ExprID;
++          ExprIDToInstructions[ExprID].push_back(&Instr);
++        } else {
++          if (DumpSets) {
++            errs() << "[HoistAnticipatedExpPassASSG] [Data Flow Analysis] "
++                      "Warning: Failed to convert instruction to key: "
++                   << Instr << " in Function " << F.getName() << "\n";
++          }
++        }
++      }
++    }
++
++    // Consistency check: every supported+convertible instruction must have a
++    // reverse-map entry.
++    for (auto &BB : F) {
++      for (auto &Instr : BB) {
++        if (!isSupportedInstruction(&Instr))
++          continue;
++
++        ExpressionAsKey Key;
++        if (!convertInstructionToExpressionAsKey(&Instr, Key))
++          continue;
++
++        assert(InstrToExprID.count(&Instr) &&
++               "Missing InstrToExprID entry during universe construction");
++      }
++    }
++
++    unsigned UniverseSize = ExpressionsUniverse.size();
++    if (DumpSets) {
++      errs() << "\n[HoistAnticipatedExpPassASSG] [Data Flow Analysis] "
++                "ExpressionsUniverse size: "
++             << UniverseSize << "\n";
++      if (UniverseSize > 0) {
++        errs() << "Universe of Expressions:\n";
++        for (unsigned ID = 0; ID < ExpressionIDToKey.size(); ++ID) {
++          const ExpressionAsKey &Key = ExpressionIDToKey[ID];
++          errs() << "  ExprID " << ID << ": opcode=" << Key.Opcode;
++          if (!Key.Operands.empty()) {
++            errs() << " operands=[";
++            for (size_t OpIdx = 0; OpIdx < Key.Operands.size(); ++OpIdx) {
++              if (OpIdx > 0)
++                errs() << ", ";
++              errs() << *Key.Operands[OpIdx];
++            }
++            errs() << "]";
++          }
++          errs() << "\n";
++        }
++      }
++      errs() << "\n";
++    }
++
++    DenseMap<BasicBlock *, BitVector> GEN, KILL;
++    for (auto &BB : F) {
++      GEN[&BB] = BitVector(UniverseSize, false);
++      KILL[&BB] = BitVector(UniverseSize, false);
++      BitVector LocalKill(UniverseSize, false);
++
++      for (auto I = BB.rbegin(), E = BB.rend(); I != E; ++I) {
++        Instruction &Instr = *I;
++
++        // Add expression to GEN if not killed by later definitions in this
++        // block.
++        if (isSupportedInstruction(&Instr)) {
++          ExpressionAsKey Key;
++          if (convertInstructionToExpressionAsKey(&Instr, Key)) {
++            auto *It = ExpressionsUniverse.find(Key);
++            assert(It != ExpressionsUniverse.end());
++            unsigned ExprID = It->second;
++
++            if (!LocalKill.test(ExprID)) {
++              GEN[&BB].set(ExprID);
++            }
++          }
++        }
++
++        // Definitions kill expressions using the defined value.
++        if (!Instr.getType()->isVoidTy()) {
++          if (ValueToExpressions.count(&Instr)) {
++            for (unsigned ExprID : ValueToExpressions[&Instr]) {
++              KILL[&BB].set(ExprID);
++              LocalKill.set(ExprID);
++            }
++          }
++        }
++      }
++    }
++
++    /// Dataflow Equations for Anticipated Expressions (Backward Analysis) :
++    /*
++    From Dragon Book 2nd Edition:
++    IN[B] = (OUT[B] - KILL[B]) U GEN[B]
++    OUT[B] = Intersection of IN[S] for all successors S of B
++
++    Initialization:
++    IN[Exit] = Universe (will evaluate to GEN[Exit] since OUT[Exit] is empty)
++    OUT[Exit] = empty set for the exit block (since no expressions can be
++    anticipated after the exit)
++
++    IN[B] = Universe for all other blocks B
++    OUT[B] = Universe for all other blocks B
++    */
++
++    // The IN set of each block represent the anticipated expressions at the
++    // ENTRY of it. We traverse the CFG in POSTORDER, to compute the IN and OUT
++    // sets iteratively until convergence (no changes). Order wont matter here
++    // since we will converge eventually.
++
++    DenseMap<BasicBlock *, BitVector> IN, OUT;
++    for (auto &BB : F) {
++      IN[&BB] = BitVector(UniverseSize, true);
++      OUT[&BB] = BitVector(UniverseSize, true);
++    }
++
++    bool Changed;
++    do {
++      Changed = false;
++      for (auto &BB : F) {
++        BitVector NewOUT(UniverseSize,
++                         false); // temporary to help compute the actual OUT
++                                 // sets for a basic block.
++
++        if (succ_empty(&BB)) {
++          // Boundary condition: OUT[Exit] = empty set
++          NewOUT.reset(); // Init OUT[Exit] to empty set
++        } else {
++          NewOUT.set(); // NOT an exit, OUT[B] is Universe
++
++          for (BasicBlock *Succ : successors(&BB)) {
++            if (IN.count(
++                    Succ)) { // Only Intersect if init is done for successor
++              NewOUT &= IN[Succ]; // OUT[B] = Intersection of IN[S] for all
++                                  // successors S of B
++            }
++          }
++        }
++
++        if (NewOUT != OUT[&BB]) { // Update OUT[B] if it has changed because of
++                                  // new information.
++          OUT[&BB] = NewOUT;
++          Changed = true;
++        }
++
++        // Compute IN[B] = GEN[B] U (OUT[B] - KILL[B])
++        BitVector NewIN = OUT[&BB];
++        // reset(const BitVector &) performs: this = this & ~Other
++        NewIN.reset(KILL[&BB]);
++        NewIN |= GEN[&BB];
++
++        if (NewIN != IN[&BB]) { // Update IN[B] if it has changed because of new
++                                // information.
++          IN[&BB] = NewIN;
++          Changed = true;
++        }
++      }
++    } while (Changed); // Repeat until no changes occur (convergence).
++
++    // ExprIDToInstructions and InstrToExprID are built while collecting the
++    // universe.
++
++    if (DumpSets) {
++      // Print final IN and OUT sets with actual expressions IR is seeing.
++      errs() << "\nIN and OUT Sets (with matching instructions) (for "
++                "debugging)\n\n";
++      for (auto &BB : F) {
++        errs() << "BasicBlock: ";
++        if (BB.hasName()) {
++          errs() << BB.getName();
++        } else {
++          BB.printAsOperand(errs(), false);
++        }
++        errs() << "\n";
++
++        auto PrintSet = [&](StringRef Label, BitVector &Set) {
++          errs() << "  " << Label << ": { \n";
++          for (unsigned ExprID : Set.set_bits()) {
++            if (ExprID < ExpressionIDToKey.size()) {
++              const ExpressionAsKey &Key = ExpressionIDToKey[ExprID];
++              errs() << "    ExprID " << ExprID << ": ";
++
++              errs() << Instruction::getOpcodeName(Key.Opcode);
++              if (Key.InstrType) {
++                errs() << " ";
++                Key.InstrType->print(errs());
++              }
++              errs() << " ";
++              for (size_t Idx = 0; Idx < Key.Operands.size(); ++Idx) {
++                if (Idx > 0)
++                  errs() << ", ";
++                Key.Operands[Idx]->printAsOperand(errs(), false);
++              }
++              errs() << "\n";
++            } else {
++              errs() << "    ExprID " << ExprID << ": [Unknown ID]\n";
++            }
++          }
++          errs() << "  }\n";
++        };
++
++        PrintSet("IN", IN[&BB]);
++        PrintSet("OUT", OUT[&BB]);
++        errs() << "\n";
++      }
++    }
++
++    // Hoisting Decisions :
++    // Rebuild analysis from current IR each pipeline iteration.
++    DominatorTree DT(F);
++    LoopInfo LI(DT);
++
++    DenseSet<unsigned> HoistedExprs;
++    bool HoistingChanged = false;
++
++    // Traverse the dominator tree in preorder
++    for (DomTreeNode *Node : depth_first(DT.getRootNode())) {
++      BasicBlock *B = Node->getBlock();
++      if (!B)
++        continue;
++      if (B->isEHPad())
++        continue;
++
++      for (unsigned ExprID = 0; ExprID < UniverseSize; ++ExprID) {
++
++        // Hoisting Decisions : Only hoist once per expression in one iteration
++        if (HoistedExprs.count(ExprID)) {
++          if (DumpSets)
++            errs() << "[HOIST-DEBUG] ExprID " << ExprID
++                   << ": SKIPPED (already hoisted)\n";
++          continue;
++        }
++
++        // Hoisting Decisions : Placement condition : OUT[B]
++        // because we want to hoist to the HIGHEST possible point, GEN[B] means
++        // we already have this expression in the block, so no need to hoist
++        // there, just update uses
++        if (!OUT[B].test(ExprID)) {
++          continue;
++        }
++
++        // Hoisting Decisions : Check that expression is actually present in the
++        // IR
++        Instruction *Template = nullptr;
++        for (Instruction *I : ExprIDToInstructions[ExprID]) {
++          if (I->getParent()) { // Still in a block (not deleted)
++            Template = I;
++            break;
++          }
++        }
++        if (!Template) {
++          if (DumpSets)
++            errs() << "[HOIST-DEBUG] ExprID " << ExprID
++                   << ": SKIPPED (no live template)\n";
++          continue; // All instances were deleted (means expression is dead, no
++                    // point in hoisting)
++        }
++
++        // Hoisting Decisions : fetch the expression key for this expression ID
++        // to use in checks and debug output
++        const ExpressionAsKey &Key = ExpressionIDToKey[ExprID];
++
++        // Hoisting Decisions : Safety check
++        bool SafeToHoist = false;
++
++        if (auto *CI = dyn_cast<CallInst>(Template)) {
++          // Allow only fully pure calls (e.g., exp with nounwind memory(none))
++          SafeToHoist = CI->doesNotThrow() && CI->doesNotAccessMemory() &&
++                        !CI->doesNotReturn();
++        } else {
++          // For non-calls use LLVM’s isSafeToSpeculativelyExecute
++          SafeToHoist = isSafeToSpeculativelyExecute(Template);
++        }
++
++        if (!SafeToHoist) {
++          if (DumpSets) {
++            errs() << "[HOIST-DEBUG] ExprID " << ExprID << " (*" << *Template
++                   << "): SKIPPED (not safe to hoist)\n";
++
++            if (auto *CI = dyn_cast<CallInst>(Template)) {
++              errs() << "  CallInst Analysis:\n";
++              errs() << "    doesNotThrow=" << CI->doesNotThrow() << "\n";
++              errs() << "    doesNotAccessMemory=" << CI->doesNotAccessMemory()
++                     << "\n";
++              errs() << "    doesNotReturn=" << CI->doesNotReturn() << "\n";
++            } else {
++              errs() << "  Non-call rejected by isSafeToSpeculativelyExecute\n";
++            }
++          }
++          continue;
++        }
++
++        // Hoisting Decisions : Operand dominance check - all operands must
++        // dominate insertion point for correctness
++        bool AllOpsDominate = true;
++        for (Value *Op : Key.Operands) {
++          if (Instruction *OpI = dyn_cast<Instruction>(Op)) {
++            if (!DT.dominates(OpI, B->getTerminator())) {
++              AllOpsDominate = false;
++              if (DumpSets)
++                errs() << "[HOIST-DEBUG] ExprID " << ExprID
++                       << ": SKIPPED (operand doesn't dominate)\n";
++              break;
++            }
++          }
++        }
++        if (!AllOpsDominate)
++          continue;
++
++        // Hoisting Decisions : HAVE A SEPARATE PASS FOR LOOPS : don't hoist
++        // anything involving loops
++        Loop *SrcLoop = LI.getLoopFor(Template->getParent());
++        Loop *DstLoop = LI.getLoopFor(B);
++
++        if (SrcLoop != nullptr || DstLoop != nullptr) {
++          continue; // Skip any expression IN the loops
++        }
++
++        // Hoisting Decisions : Determine host instruction
++        Instruction *HostInst = nullptr;
++
++        // Hoisting Decisions : Try to reuse existing computation in this block
++        // (if in GEN[B])
++        if (GEN[B].test(ExprID)) {
++          for (Instruction *Candidate : ExprIDToInstructions[ExprID]) {
++            if (Candidate->getParent() == B &&
++                DT.dominates(Candidate, B->getTerminator())) {
++              HostInst = Candidate;
++              break;
++            }
++          }
++        }
++
++        // Hoisting Decisions : If no reusable instruction, create new one
++        if (!HostInst) {
++          HostInst = Template->clone();
++          HostInst->insertBefore(B->getTerminator());
++          HostInst->setName("hoisted." + Twine(ExprID));
++          HoistingChanged = true;
++          if (DumpSets)
++            errs() << "[HOIST] CLONED new instruction: " << *HostInst << "\n";
++        }
++
++        InstrToExprID[HostInst] =
++            ExprID; // update mapping for the new host instruction.
++
++        // Hoisting Decisions : Replace dominated occurrences with the host
++        // instruction (inside and outside the block)
++        SmallVector<Instruction *, 8> OldInsts(
++            ExprIDToInstructions[ExprID].begin(),
++            ExprIDToInstructions[ExprID].end());
++        SmallVector<Instruction *, 8> UpdatedInsts;
++
++        for (Instruction *Old : OldInsts) {
++          if (Old == HostInst) {
++            continue; // Will add at end
++          }
++          if (!Old->getParent()) {
++            continue; // Already deleted, don't track
++          }
++
++          if (DT.dominates(HostInst, Old)) {
++            // Dominated - replace and remove from tracking
++            if (DumpSets) {
++              errs() << "[HOIST] REPLACED: " << *Old << " with: " << *HostInst
++                     << "\n";
++            }
++            Old->replaceAllUsesWith(HostInst);
++            InstrToExprID.erase(Old);
++            Old->eraseFromParent();
++            HoistingChanged = true;
++          } else {
++            // Not dominated - keep tracking it
++            UpdatedInsts.push_back(Old);
++          }
++        }
++
++        // Add host instruction to tracking
++        UpdatedInsts.push_back(HostInst);
++        ExprIDToInstructions[ExprID].swap(UpdatedInsts);
++
++        // Flag expression as as hoisted
++        HoistedExprs.insert(ExprID);
++      }
++    }
++
++    // Debug output : print modified functions names after hoisting.
++    if (HoistingChanged) {
++      if (DumpSets) {
++        errs()
++            << "\n[HoistAnticipatedExpPassASSG] [Hoisting Decisions] function "
++            << F.getName() << " changed after hoisting\n";
++        errs() << F << "\n\n";
++      }
++    }
++
++    if (!HoistingChanged) {
++      if (DumpSets) {
++        errs()
++            << "\n[HoistAnticipatedExpPassASSG] [Hoisting Decisions] function "
++            << F.getName() << " NOT changed after hoisting\n";
++      }
++    }
++
++    // Dedicated Pass for Anticipated Expressions based LIMITED LICM
++    // implementation : For each loopp, hoist loop-invariant anticipated
++    // expressions to the preheader Process loops in postorder (innermost first)
++    // to handle nested loops correctly using a worklist and visited sets
++
++    bool LICMChangedIR = false;
++
++    // Collect all loops (including nested) in postorder.
++    SmallVector<Loop *, 8> AllLoops;
++    SmallVector<Loop *, 8> Worklist;
++
++    for (Loop *TopLoop : LI)
++      Worklist.push_back(TopLoop);
++
++    // Depth-first postorder traversal to collect loops from innermost to
++    // outermost.
++    SmallPtrSet<Loop *, 8> Visited;
++    while (!Worklist.empty()) {
++      Loop *L = Worklist.back();
++
++      if (Visited.count(L)) {
++        Worklist.pop_back();
++        AllLoops.push_back(L); // Add after processing children (postorder).
++        continue;
++      }
++
++      Visited.insert(L);
++      for (Loop *SubLoop : L->getSubLoops())
++        Worklist.push_back(SubLoop);
++    }
++
++    // Now AllLoops contains every loop in postorder traversal (innermost
++    // first), now can do LICM.
++
++    // Process all loops from innermost to outermost.
++    for (auto *Loop : AllLoops) {
++
++      BasicBlock *Header = Loop->getHeader();
++      BasicBlock *Preheader = Loop->getLoopPreheader();
++
++      if (!Preheader) {
++        if (DumpSets) {
++          errs() << "[LICM] Loop has no preheader, skipping\n";
++        }
++        continue; // Can't hoist without a preheader.
++      }
++
++      for (unsigned ExprID = 0; ExprID < UniverseSize; ++ExprID) {
++        // Hoisting Condition: check if expression is anticipated at loop
++        // header.
++        if (!OUT[Header].test(ExprID)) {
++          if (DumpSets)
++            errs() << "[LICM-DEBUG] ExprID " << ExprID
++                   << ": SKIPPED (!OUT[Header])\n";
++          continue; // Not anticipated in loop, skip
++        }
++
++        // Hoisting Condition: Don't hoist if header already generates it.
++        if (GEN[Header].test(ExprID)) {
++          if (DumpSets)
++            errs() << "[LICM-DEBUG] ExprID " << ExprID
++                   << ": SKIPPED (GEN[Header])\n";
++          continue;
++        }
++
++        // If no existing host then to find a template instruction for this
++        // expression.
++        Instruction *Template = nullptr;
++        for (Instruction *I : ExprIDToInstructions[ExprID]) {
++          if (I->getParent() && Loop->contains(I->getParent())) {
++            Template = I; // Found one in the loop
++            break;
++          }
++        }
++        if (!Template) {
++          if (DumpSets)
++            errs() << "[LICM-DEBUG] ExprID " << ExprID
++                   << ": SKIPPED (no template in loop)\n";
++          continue; // Expression doesn't occur in loop
++        }
++
++        const ExpressionAsKey &Key = ExpressionIDToKey[ExprID];
++
++        // Hoisting Condition: Safety check
++        bool SafeToHoist = false;
++        if (auto *CI = dyn_cast<CallInst>(Template)) {
++          // Allow only fully pure calls (e.g., exp with nounwind memory(none))
++          SafeToHoist = CI->doesNotThrow() && CI->doesNotAccessMemory() &&
++                        !CI->doesNotReturn();
++        } else {
++          // For non-calls use LLVM’s isSafeToSpeculativelyExecute
++          SafeToHoist = isSafeToSpeculativelyExecute(Template);
++        }
++
++        if (!SafeToHoist) {
++          if (DumpSets) {
++            errs() << "[HOIST-DEBUG] ExprID " << ExprID << " (*" << *Template
++                   << "): SKIPPED (not safe to hoist)\n";
++
++            if (auto *CI = dyn_cast<CallInst>(Template)) {
++              errs() << "  CallInst Analysis:\n";
++              errs() << "    doesNotThrow=" << CI->doesNotThrow() << "\n";
++              errs() << "    doesNotAccessMemory=" << CI->doesNotAccessMemory()
++                     << "\n";
++              errs() << "    doesNotReturn=" << CI->doesNotReturn() << "\n";
++            } else {
++              errs() << "  Non-call rejected by isSafeToSpeculativelyExecute\n";
++            }
++          }
++          continue;
++        }
++
++        // LICM Condition: Check that all operands are loop-invariant.
++        bool AllInvariant = true;
++        for (Value *Op : Key.Operands) {
++          if (!Loop->isLoopInvariant(Op)) {
++            AllInvariant = false;
++            if (DumpSets)
++              errs() << "[LICM-DEBUG] ExprID " << ExprID
++                     << ": SKIPPED (operand not loop-invariant)\n";
++            break;
++          }
++        }
++        if (!AllInvariant)
++          continue;
++
++        // CAN HOIST instr to preheader.
++        Instruction *LICMInst = Template->clone();
++        LICMInst->insertBefore(Preheader->getTerminator());
++        LICMInst->setName("licm.hoisted." + Twine(ExprID));
++
++        if (DumpSets) {
++          errs() << "[LICM] Hoisting to preheader: " << *LICMInst << "\n";
++        }
++
++        // Have to replace ALL dominated occurrences (inside and outside loop).
++        SmallVector<Instruction *, 8> AllInsts(
++            ExprIDToInstructions[ExprID].begin(),
++            ExprIDToInstructions[ExprID].end());
++        SmallVector<Instruction *, 8> UpdatedLICMInsts;
++
++        for (Instruction *OldInst : AllInsts) {
++          if (OldInst == LICMInst) {
++            continue; // Will add at end
++          }
++          if (!OldInst->getParent()) {
++            continue; // Already deleted, don't track
++          }
++
++          if (DT.dominates(LICMInst, OldInst)) {
++            // Dominated - replace and remove from tracking
++            if (DumpSets) {
++              errs() << "[LICM] Replacing: " << *OldInst
++                     << " with: " << *LICMInst << "\n";
++            }
++            OldInst->replaceAllUsesWith(LICMInst);
++            InstrToExprID.erase(OldInst);
++            OldInst->eraseFromParent();
++            LICMChangedIR = true;
++          } else {
++            // Not dominated - keep tracking it
++            UpdatedLICMInsts.push_back(OldInst);
++          }
++        }
++
++        // Add LICM hoisted instruction to tracking (to allow hoisting for outer
++        // loops if needed)
++        InstrToExprID[LICMInst] = ExprID;
++        UpdatedLICMInsts.push_back(LICMInst);
++        ExprIDToInstructions[ExprID].swap(UpdatedLICMInsts);
++      }
++    }
++
++    if (LICMChangedIR) {
++      if (DumpSets) {
++        errs() << "\n[HoistAnticipatedExpPassASSG] [AniticipatedExpBasedLICM] "
++                  "function "
++               << F.getName() << " changed after LICM\n";
++        errs() << F << "\n\n";
++      }
++    }
++
++    if (!LICMChangedIR) {
++      if (DumpSets) {
++        errs() << "\n[HoistAnticipatedExpPassASSG] [AniticipatedExpBasedLICM] "
++                  "function "
++               << F.getName() << " not changed after LICM\n";
++      }
++    }
++
++    PipelineChangedInIter = HoistingChanged || LICMChangedIR;
++    AnyChanged |= PipelineChangedInIter;
++    ++PipelineIter;
++  } while (PipelineChangedInIter && PipelineIter < MaxPipelineIters);
++
++  return AnyChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
++}
+-- 
+2.43.0
+
