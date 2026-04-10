@@ -1,0 +1,957 @@
+From 9ab783b73496bb828aa19e82cfe09ce03d311db6 Mon Sep 17 00:00:00 2001
+From: devashish <devashish.dhaulakhandi@gmail.com>
+Date: Fri, 10 Apr 2026 17:22:37 +0530
+Subject: [PATCH] Compilers Assg 2a MLIR affine loop interchange implementation
+
+---
+ mlir/include/mlir/Dialect/Affine/Passes.h     |   4 +
+ mlir/include/mlir/InitAllPasses.h             |   4 +
+ ...AffineLoopInterchangePassCompilersAssg.cpp | 884 ++++++++++++++++++
+ mlir/lib/Transforms/CMakeLists.txt            |   3 +
+ 4 files changed, 895 insertions(+)
+ create mode 100644 mlir/lib/Transforms/AffineLoopInterchangePassCompilersAssg.cpp
+
+diff --git a/mlir/include/mlir/Dialect/Affine/Passes.h b/mlir/include/mlir/Dialect/Affine/Passes.h
+index 2f70f24dd3ef..76ba3062e623 100644
+--- a/mlir/include/mlir/Dialect/Affine/Passes.h
++++ b/mlir/include/mlir/Dialect/Affine/Passes.h
+@@ -20,6 +20,10 @@
+ 
+ namespace mlir {
+ 
++// Forward declare the affine Loop Interchange pass 
++void registerAffineLoopInterchangePass();
++
++
+ namespace func {
+ class FuncOp;
+ } // namespace func
+diff --git a/mlir/include/mlir/InitAllPasses.h b/mlir/include/mlir/InitAllPasses.h
+index dd8b292a8734..b37c3926e639 100644
+--- a/mlir/include/mlir/InitAllPasses.h
++++ b/mlir/include/mlir/InitAllPasses.h
+@@ -61,6 +61,10 @@ namespace mlir {
+ // The global registry is interesting to interact with the command-line tools.
+ inline void registerAllPasses() {
+   // General passes
++
++  // registering the custom affine loop interchange pass :
++  registerAffineLoopInterchangePass();
++
+   registerTransformsPasses();
+ 
+   // Conversion passes
+diff --git a/mlir/lib/Transforms/AffineLoopInterchangePassCompilersAssg.cpp b/mlir/lib/Transforms/AffineLoopInterchangePassCompilersAssg.cpp
+new file mode 100644
+index 000000000000..6e9b8665eed1
+--- /dev/null
++++ b/mlir/lib/Transforms/AffineLoopInterchangePassCompilersAssg.cpp
+@@ -0,0 +1,884 @@
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/STLExtras.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/Support/raw_ostream.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdlib>
++#include <limits>
++
++#include "mlir/Analysis/FlatLinearValueConstraints.h"
++
++#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
++#include "mlir/Dialect/Affine/IR/AffineOps.h"
++#include "mlir/Dialect/Affine/LoopUtils.h"
++#include "mlir/Dialect/Affine/Passes.h"
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/IR/AffineExpr.h"
++#include "mlir/IR/AffineMap.h"
++#include "mlir/IR/AsmState.h"
++#include "mlir/Pass/Pass.h"
++#include "mlir/Support/LogicalResult.h"
++
++using namespace mlir;
++
++#ifndef AFFINE_LOOP_INTERCHANGE_VERBOSE
++#define AFFINE_LOOP_INTERCHANGE_VERBOSE 0
++#endif
++
++#if AFFINE_LOOP_INTERCHANGE_VERBOSE
++#define AFFINE_LOOP_INTERCHANGE_VLOG() llvm::errs()
++#else
++#define AFFINE_LOOP_INTERCHANGE_VLOG() llvm::nulls()
++#endif
++
++namespace {
++
++// !!!!! have to do mlir-opt ----.mlir -affine-loop-interchange
++// --mlir-disable-threading to make it print ungarbled stuff
++
++// info func:
++// to find and print all affine.for loops, their induction variables,
++// bounds, and nesting levels.
++void printSingleAffineForLoop(affine::AffineForOp forOp) {
++
++  // compute nesting depth by counting the number of parent affine.for loops.
++  int depth = 0;
++  Operation *parent = forOp->getParentOp();
++  while (parent) {
++    if (isa<affine::AffineForOp>(parent))
++      depth++;
++    parent = parent->getParentOp();
++  }
++
++  // indentation.
++  for (int i = 0; i < depth; ++i)
++    AFFINE_LOOP_INTERCHANGE_VLOG() << "  ";
++
++  AFFINE_LOOP_INTERCHANGE_VLOG()
++      << "Loop (depth=" << depth
++      << ") "; // << "Loop Induction Var: " << forOp.getInductionVar() << "\n";
++
++  AFFINE_LOOP_INTERCHANGE_VLOG() << "LowerBound=";
++  AFFINE_LOOP_INTERCHANGE_VLOG() << forOp.getLowerBoundMap(); // .dump();
++
++  AFFINE_LOOP_INTERCHANGE_VLOG() << " UpperBound=";
++  AFFINE_LOOP_INTERCHANGE_VLOG() << forOp.getUpperBoundMap(); // .dump();
++
++  AFFINE_LOOP_INTERCHANGE_VLOG() << "\n";
++}
++
++// DEFNS: helper functions for checking legality of interchange
++// :-------------------------------------------------------
++bool isPerfectNest(affine::AffineForOp root) {
++  affine::AffineForOp current = root;
++
++  while (true) {
++    auto ops = current.getBody()->without_terminator();
++    llvm::SmallVector<Operation *, 2> bodyOps;
++    for (Operation &op : ops)
++      bodyOps.push_back(&op);
++
++    // if the body is empty, the chain ends here. it's a perfect (but empty)
++    // nest.
++    if (bodyOps.empty())
++      return true;
++
++    // if there is exactly one operation and it's a loop, keep descending.
++    if (bodyOps.size() == 1) {
++      if (auto next = dyn_cast<affine::AffineForOp>(bodyOps[0])) {
++        current = next;
++        continue;
++      }
++      // if the one op is not a loop (e.g., just a load), it's a perfect leaf.
++      return true;
++    }
++
++    // if there is more than one operation, it can only be "perfect" if
++    // none of those operations are loops (i.e., this is the computation leaf).
++    for (Operation *op : bodyOps) {
++      if (isa<affine::AffineForOp>(op))
++        return false; // found a sibling loop.
++    }
++
++    return true;
++  }
++}
++bool isNonRectangularLoopPERFECTNest(affine::AffineForOp problemRoot) {
++  if (!problemRoot)
++    return false;
++
++  llvm::SmallVector<affine::AffineForOp, 6> loopsFound;
++  // take only the perfectly nested loops starting from this root.
++  affine::getPerfectlyNestedLoops(loopsFound, problemRoot);
++
++  // if there's only one loop, it's rectangular by definition (no inner loops
++  // to depend on it).
++  if (loopsFound.size() < 2)
++    return false;
++
++  // collect induction variables to avoid repeated calls.
++  llvm::SmallVector<Value, 6> ivs;
++  for (auto loop : loopsFound) {
++    ivs.push_back(loop.getInductionVar());
++  }
++
++  // check each loop starting from the first inner loop (index 1).
++  for (size_t i = 1; i < loopsFound.size(); ++i) {
++    auto currentLoop = loopsFound[i];
++
++    // check both lower and upper bounds for any mention of outer induction
++    // variables.
++    auto checkBound = [&](OperandRange operands) {
++      for (Value operand : operands) {
++        for (size_t j = 0; j < i; ++j) {
++          if (operand == ivs[j])
++            return true;
++        }
++      }
++      return false;
++    };
++
++    if (checkBound(currentLoop.getLowerBoundOperands()) ||
++        checkBound(currentLoop.getUpperBoundOperands())) {
++      return true; // found a dependency on an outer loop induction var.
++    }
++  }
++
++  return false;
++}
++
++bool hasAffineIfInLoopNest(affine::AffineForOp problemLoop) {
++  // returns true if an affine.if is found anywhere under this loop.
++  return problemLoop
++      .walk([&](affine::AffineIfOp) { return WalkResult::interrupt(); })
++      .wasInterrupted();
++}
++
++int getLoopDepth(affine::AffineForOp forOp) {
++  int depth = 0;
++  Operation *parent = forOp->getParentOp();
++  while (parent) {
++    if (isa<affine::AffineForOp>(parent))
++      ++depth;
++    parent = parent->getParentOp();
++  }
++  return depth;
++}
++
++bool isValidPermutationMap(ArrayRef<unsigned> permMap) {
++  SmallVector<unsigned, 6> sortedPerm(permMap.begin(), permMap.end());
++  llvm::sort(sortedPerm);
++  return llvm::all_of(llvm::enumerate(sortedPerm), [](const auto &entry) {
++    return entry.value() == entry.index();
++  });
++}
++
++FailureOr<unsigned> safePermuteLoops(ArrayRef<affine::AffineForOp> loops,
++                                     ArrayRef<unsigned> permMap) {
++  // guard hard preconditions of affine::permuteLoops to avoid assertion.
++  if (loops.size() != permMap.size())
++    return failure();
++  if (!isValidPermutationMap(permMap))
++    return failure();
++
++  return affine::permuteLoops(loops, permMap);
++}
++
++// imperfect root distribution helper
++// :-----------------------------------------------------------
++
++bool distributeImperfectNestIntoSingleChildRoots(
++    affine::AffineForOp root,
++    SmallVectorImpl<affine::AffineForOp> &distributedRoots) {
++
++  SmallVector<Operation *, 8> bodyOps;
++  for (Operation &op : root.getBody()->without_terminator())
++    bodyOps.push_back(&op);
++
++  // only handle imperfect nests whose body consists solely of sibling
++  // affine.for operations.
++  if (bodyOps.size() < 2)
++    return false;
++  if (!llvm::all_of(bodyOps,
++                    [](Operation *op) { return isa<affine::AffineForOp>(op); }))
++    return false;
++
++  auto keepOnlyNthBodyOp = [](affine::AffineForOp forOp, unsigned keepIdx) {
++    SmallVector<Operation *, 8> toErase;
++    unsigned idx = 0;
++    for (Operation &op : forOp.getBody()->without_terminator()) {
++      if (idx != keepIdx)
++        toErase.push_back(&op);
++      ++idx;
++    }
++    for (Operation *op : toErase)
++      op->erase();
++  };
++
++  distributedRoots.clear();
++  distributedRoots.push_back(root);
++
++  Operation *insertAfter = root.getOperation();
++  for (unsigned keepIdx = 1; keepIdx < bodyOps.size(); ++keepIdx) {
++    Operation *cloneOp = root->clone();
++    Block::iterator insertPoint(insertAfter);
++    ++insertPoint;
++    root->getBlock()->getOperations().insert(insertPoint, cloneOp);
++    insertAfter = cloneOp;
++
++    auto clonedRoot = cast<affine::AffineForOp>(cloneOp);
++    keepOnlyNthBodyOp(clonedRoot, keepIdx);
++    distributedRoots.push_back(clonedRoot);
++  }
++
++  // keep first child in the original root.
++  keepOnlyNthBodyOp(root, /*keepIdx=*/0);
++  return true;
++}
++
++// END: helper functions for checking legality of interchange
++// :-------------------------------------------------------
++
++// DEFNS: helpers for Loop Nest Analysis
++// :-------------------------------------------------------
++struct LoopStrideContribution {
++  bool valid = false;
++  int64_t targetCoeff = 0;
++  bool hasOtherLoopIvs = false;
++};
++
++LoopStrideContribution
++analyzeStrideContribution(AffineExpr expr, OperandRange operands,
++                          ArrayRef<Value> loopIvs, Value targetIv,
++                          unsigned numDims, unsigned numSymbols) {
++  LoopStrideContribution analysis;
++
++  SmallVector<int64_t, 8> flatExpr;
++  if (failed(getFlattenedAffineExpr(expr, numDims, numSymbols, &flatExpr)))
++    return analysis;
++
++  // Reject semi-affine forms that introduce local variables.
++  if (flatExpr.size() != numDims + numSymbols + 1)
++    return analysis;
++
++  analysis.valid = true;
++
++  for (unsigned dim = 0; dim < numDims; ++dim) {
++    int64_t coeff = flatExpr[dim];
++    if (coeff == 0)
++      continue;
++
++    Value operand = operands[dim];
++    if (operand == targetIv) {
++      analysis.targetCoeff += coeff;
++      continue;
++    }
++
++    if (llvm::is_contained(loopIvs, operand))
++      analysis.hasOtherLoopIvs = true;
++  }
++
++  return analysis;
++}
++
++// helper struct for cost model implementation.
++struct PerLoopScoreCardForInterchange {
++
++  affine::AffineForOp loop; // reference to the loop being scored to map
++                            // computed metrics back to the actual ir.
++
++  // spatial.
++  size_t stride1AccessCount = 0;
++  // number of arrays for which this loop's iv gives (min : try later) /
++  // stride-1 access (fastest-moving dimension).
++  // the higher, the better for inner placement for spatial locality.
++
++  size_t strideOneDHits = 0;
++  // unit-stride hits on rank-1 accesses.
++  size_t strideOneMultidHits = 0;
++  // unit-stride hits on rank>=2 accesses.
++  size_t strideTwoPlusHits = 0;
++  // affine last-dim accesses driven by this iv with stride magnitude > 1.
++  size_t dominantLastDimHits = 0;
++  // cases where this iv is the only loop iv contributing to last dimension.
++  size_t nonlinearAccesses = 0;
++  // cases where we could not derive reliable linear coefficients.
++  size_t minStride = std::numeric_limits<size_t>::max();
++  // minimum observed absolute stride coefficient for this loop iv.
++
++  // temporal.
++  size_t invariantAccesses = 0;
++  // count of memory accesses that do not depend on this loop iv.
++  // high values suggest loop can move outward to maximize reuse of invariant
++  // data.
++  size_t totalAccesses = 0;
++  // total memory accesses in the loop to compute invariance ratio if needed.
++  double invariantRatio = 0.0;
++  // ratio of invariant accesses to total accesses. higher ratio favors outer
++  // placement for temporal reuse.
++  size_t invariantWeightedByDepth = 0;
++  // invariance weighted by loop position to reflect reuse opportunity.
++
++  size_t maxInvariantPerArray = 0;
++  // for each array, find the max number of invariant accesses.
++  // helps identify arrays that benefit most from temporal reuse.
++
++  // parallelism.
++  double independentIterationRatio = 0.0;
++  // fraction of iterations that can run independently.
++  // larger values mean more parallelism; zero means fully serial.
++
++  bool hasDependenciesForParallelism = false;
++  // simple flag: true if there are dependencies that prevent interchange.
++};
++
++// function to check if a permutation is even legal.
++bool isPermutationLegal(
++    const SmallVector<affine::AffineForOp, 6> &originalLoops,
++    const SmallVector<unsigned, 6> &permutation) {
++
++  auto res =
++      affine::isValidLoopInterchangePermutation(originalLoops, permutation);
++  return res;
++}
++
++// function to generate all possible permutations and eliminate the ones that
++// are not legal (interchangeable [using the mlir::api]) at all.
++SmallVector<SmallVector<unsigned, 6>, 24> getAllPossibleLegalPermutations(
++    const SmallVector<affine::AffineForOp, 6> &loopNest) {
++  SmallVector<SmallVector<unsigned, 6>, 24> legalPermutations;
++  unsigned n = loopNest.size();
++  SmallVector<unsigned, 6> basePermutation;
++  for (unsigned i = 0; i < n; ++i)
++    basePermutation.push_back(i);
++
++  do {
++    if (isPermutationLegal(loopNest, basePermutation)) {
++      legalPermutations.push_back(basePermutation);
++    }
++  } while (
++      std::next_permutation(basePermutation.begin(), basePermutation.end()));
++
++  return legalPermutations;
++}
++
++// struct to help compute and compare spatial locality features.
++struct SpatialRank {
++  int multid = 0;
++  int oneD = 0;
++
++  // standard tuple comparison: multidimensional hits are the primary priority.
++  bool operator<(const SpatialRank &other) const {
++    if (multid != other.multid)
++      return multid < other.multid;
++    return oneD < other.oneD;
++  }
++  bool operator>(const SpatialRank &other) const { return other < *this; }
++};
++
++// struct to hold all the features of a given permutation for comparison in the
++// cost model.
++struct PermutationFeatures {
++  // spatial disruption feature.
++  int spatialDisruption = 0;
++
++  // temporal, parallel, and stability features.
++  int temporalScore = 0;
++  int parallelScore = 0;
++  int stabilityPenalty = 0;
++};
++
++// the WEIGHTS that are actually used to make decisions in the cost model.
++PermutationFeatures computeFeaturesForPermutation(
++    const SmallVector<unsigned, 6> &perm,
++    const SmallVector<PerLoopScoreCardForInterchange, 6> &cards) {
++
++  int n = perm.size();
++  PermutationFeatures f = {};
++
++  // `perm` is a loop-permutation map: original loop i -> new position perm[i].
++  // build the inverse so we can reason by position (outermost to innermost).
++  SmallVector<unsigned, 6> oldLoopAtPos(n, 0);
++  for (int oldIdx = 0; oldIdx < n; ++oldIdx)
++    oldLoopAtPos[perm[oldIdx]] = oldIdx;
++
++  for (int pos = 0; pos < n; ++pos) {
++    const auto &card = cards[oldLoopAtPos[pos]];
++    int innerWeight = pos + 1;
++    int outerWeight = n - pos;
++
++    // strong stride-1 loops in inner positions MUST dominate.
++    int spatialStrength = static_cast<int>(card.strideOneMultidHits) * 10 +
++                          static_cast<int>(card.strideOneDHits) * 2 +
++                          static_cast<int>(card.dominantLastDimHits);
++    f.spatialDisruption -= spatialStrength * innerWeight;
++
++    // favor loops with reuse potential in inner positions NExt.
++    int temporalStrength = static_cast<int>(card.invariantAccesses) +
++                           static_cast<int>(card.maxInvariantPerArray) +
++                           static_cast<int>(card.invariantWeightedByDepth);
++    f.temporalScore += temporalStrength * innerWeight;
++
++    // favor independent loops in outer positions for coarse-grain parallelism.
++    f.parallelScore +=
++        static_cast<int>(card.independentIterationRatio * 100.0) * outerWeight;
++
++    // stability penalty, dont want to move loops too far from their original
++    // position without gain.
++    f.stabilityPenalty += std::abs(static_cast<int>(perm[pos]) - pos);
++  }
++
++  return f;
++}
++
++bool isBetter(const PermutationFeatures &a, const PermutationFeatures &b) {
++  // compare spatial disruption first, but allow soft tie-break behavior.
++  if (a.spatialDisruption != b.spatialDisruption) {
++    int maxAbs =
++        std::max(std::abs(a.spatialDisruption), std::abs(b.spatialDisruption));
++    int diff = std::abs(a.spatialDisruption - b.spatialDisruption);
++    // if spatial difference is clearly large (absolute or relative), respect
++    // it. otherwise, let temporal/parallel goals break ties.
++    if (diff >= 8 || (maxAbs > 0 && (double)diff / (double)maxAbs > 0.30))
++      return a.spatialDisruption < b.spatialDisruption;
++  }
++
++  // compare temporal reuse next.
++  if (a.temporalScore != b.temporalScore)
++    return a.temporalScore > b.temporalScore;
++
++  // compare parallelism next.
++  if (a.parallelScore != b.parallelScore)
++    return a.parallelScore > b.parallelScore;
++
++  // compare stability last.
++  if (a.stabilityPenalty != b.stabilityPenalty)
++    return a.stabilityPenalty < b.stabilityPenalty;
++
++  return false; // truly equal.
++}
++
++// function to analyze the cost of given sets of legal permutations and find
++// the best one.
++SmallVector<unsigned, 6> findBestPermutation(
++    const SmallVector<affine::AffineForOp, 6> &loopNest,
++    const SmallVector<PerLoopScoreCardForInterchange, 6> &cards,
++    const SmallVector<SmallVector<unsigned, 6>, 24> &legalPermutations) {
++
++  // handle empty input.
++  if (legalPermutations.empty())
++    return {};
++
++  // initialize with the first legal permutation.
++  SmallVector<unsigned, 6> bestPerm = legalPermutations[0];
++  PermutationFeatures bestFeatures =
++      computeFeaturesForPermutation(bestPerm, cards);
++
++  // iterate through all other legal permutations.
++  for (size_t i = 1; i < legalPermutations.size(); ++i) {
++    const auto &currentPerm = legalPermutations[i];
++    PermutationFeatures currentFeatures =
++        computeFeaturesForPermutation(currentPerm, cards);
++
++    // use your isBetter lexicographical logic.
++    if (isBetter(currentFeatures, bestFeatures)) {
++      bestFeatures = currentFeatures;
++      bestPerm = currentPerm;
++    }
++  }
++
++  return bestPerm;
++}
++
++// extracting features from the loop nest.
++SmallVector<PerLoopScoreCardForInterchange, 6> computeParamsForGivenLoopNest(
++    const SmallVector<affine::AffineForOp, 6> &loopNest,
++    SmallVector<PerLoopScoreCardForInterchange, 6> &scoresForEachLoopInNest) {
++
++  // analyze the body of the loops to get the related info for the scorecards.
++  auto innermostLoop = loopNest.back();
++
++  // to track invariance per array to fill maxInvariantPerArray.
++  // Maps: LoopIndex -> (MemRef -> InvariantCount)
++  SmallVector<llvm::DenseMap<Value, size_t>, 6> invariantTracking(
++      loopNest.size());
++
++  SmallVector<Value, 6> loopIvs;
++  for (auto loop : loopNest)
++    loopIvs.push_back(loop.getInductionVar());
++
++  innermostLoop.walk([&](Operation *op) {
++    // looking only for memory access operations that implement affine
++    // read/write.
++    auto readOp = dyn_cast<affine::AffineReadOpInterface>(op);
++    auto writeOp = dyn_cast<affine::AffineWriteOpInterface>(op);
++    if (!readOp && !writeOp)
++      return;
++
++    auto map = readOp ? readOp.getAffineMap() : writeOp.getAffineMap();
++    auto operands = readOp ? readOp.getMapOperands() : writeOp.getMapOperands();
++    Value memref = readOp ? readOp.getMemRef() : writeOp.getMemRef();
++    unsigned numResults = map.getNumResults();
++
++    // spatial: stride-1.
++    if (numResults > 0) {
++      auto lastResult = map.getResult(numResults - 1);
++
++      for (size_t loopIdx = 0; loopIdx < loopNest.size(); ++loopIdx) {
++        Value iv = loopIvs[loopIdx];
++        auto contribution =
++            analyzeStrideContribution(lastResult, operands, loopIvs, iv,
++                                      map.getNumDims(), map.getNumSymbols());
++
++        // count stride-1 only when the last result is a simple affine form
++        // whose only loop-IV contribution is this loop and the coefficient is
++        // exactly +/-1.
++        auto &card = scoresForEachLoopInNest[loopIdx];
++        if (!contribution.valid) {
++          card.nonlinearAccesses++;
++          continue;
++        }
++
++        if (!contribution.hasOtherLoopIvs) {
++          size_t absCoeff =
++              static_cast<size_t>(std::llabs(contribution.targetCoeff));
++
++          if (absCoeff > 0) {
++            card.dominantLastDimHits++;
++            card.minStride = std::min(card.minStride, absCoeff);
++
++            if (absCoeff == 1) {
++              if (numResults == 1)
++                card.strideOneDHits++;
++              else
++                card.strideOneMultidHits++;
++            } else {
++              card.strideTwoPlusHits++;
++            }
++          }
++        }
++      }
++    }
++
++    // temporal: invariance.
++    for (size_t loopIdx = 0; loopIdx < loopNest.size(); ++loopIdx) {
++      Value iv = loopIvs[loopIdx];
++
++      scoresForEachLoopInNest[loopIdx].totalAccesses++;
++      bool usesIv = false;
++
++      for (unsigned r = 0; r < numResults; ++r) {
++        auto expr = map.getResult(r);
++
++        expr.walk([&](AffineExpr e) {
++          if (auto dim = dyn_cast<AffineDimExpr>(e)) {
++            if (operands[dim.getPosition()] == iv)
++              usesIv = true;
++          }
++        });
++      }
++
++      if (!usesIv) {
++        scoresForEachLoopInNest[loopIdx].invariantAccesses++;
++        scoresForEachLoopInNest[loopIdx].invariantWeightedByDepth +=
++            (loopNest.size() - loopIdx);
++        invariantTracking[loopIdx][memref]++; // track per array.
++      }
++    }
++  });
++
++  // keep legacy aggregate for existing debug/output compatibility.
++  for (size_t i = 0; i < loopNest.size(); ++i)
++    scoresForEachLoopInNest[i].stride1AccessCount =
++        scoresForEachLoopInNest[i].strideOneDHits +
++        scoresForEachLoopInNest[i].strideOneMultidHits;
++
++  // parallelism scoring.
++  for (size_t i = 0; i < loopNest.size(); ++i) {
++    auto &card = scoresForEachLoopInNest[i];
++
++    // compute maxInvariantPerArray from our tracking map.
++    if (!invariantTracking[i].empty()) {
++      for (auto &entry : invariantTracking[i]) {
++        card.maxInvariantPerArray =
++            std::max(card.maxInvariantPerArray, entry.second);
++      }
++    }
++
++    // dependency analysis: check if the loop is parallel.
++    auto loop = loopNest[i];
++    if (affine::isLoopParallel(loop)) {
++      card.independentIterationRatio = 1.0;
++      card.hasDependenciesForParallelism = false;
++    } else {
++      card.independentIterationRatio = 0.0;
++      card.hasDependenciesForParallelism = true;
++    }
++
++    if (card.totalAccesses > 0) {
++      card.invariantRatio = (double)card.invariantAccesses / card.totalAccesses;
++    }
++  }
++
++  // verification print.
++  AFFINE_LOOP_INTERCHANGE_VLOG() << std::string(50, '=') << "\n";
++  AFFINE_LOOP_INTERCHANGE_VLOG() << "LOOPS SCORECARDS\n";
++  AFFINE_LOOP_INTERCHANGE_VLOG() << std::string(50, '=') << "\n";
++
++  for (size_t i = 0; i < scoresForEachLoopInNest.size(); ++i) {
++    auto &c = scoresForEachLoopInNest[i];
++
++    AFFINE_LOOP_INTERCHANGE_VLOG() << "Loop " << i << ":\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "  - Depth:      " << getLoopDepth(c.loop) << "\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "  - IV:         " << c.loop.getInductionVar() << "\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "  - LowerBound: " << c.loop.getLowerBoundMap() << "\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "  - UpperBound: " << c.loop.getUpperBoundMap() << "\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG() << "  - Loc:        ";
++    c.loop.getLoc().print(AFFINE_LOOP_INTERCHANGE_VLOG());
++    AFFINE_LOOP_INTERCHANGE_VLOG() << "\n";
++
++    // spatial locality info.
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "  [Spatial]  Stride-1 Accesses: " << c.stride1AccessCount
++        << "  <-- (Higher favors INNERMOST position)\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "             Stride-1 (1D):     " << c.strideOneDHits << "\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "             Stride-1 (multiD): " << c.strideOneMultidHits << "\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "             Stride>1 Hits:     " << c.strideTwoPlusHits << "\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "             Dominant LastDim:  " << c.dominantLastDimHits << "\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "             Nonlinear:         " << c.nonlinearAccesses << "\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG() << "             Min Stride:        ";
++    if (c.minStride == std::numeric_limits<size_t>::max())
++      AFFINE_LOOP_INTERCHANGE_VLOG() << "N/A\n";
++    else
++      AFFINE_LOOP_INTERCHANGE_VLOG() << c.minStride << "\n";
++
++    // temporal reuse info.
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "  [Temporal] Total Invariants:  " << c.invariantAccesses
++        << "  <-- (Higher favors OUTERMOST position)\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "             Max Inv/Array:     " << c.maxInvariantPerArray
++        << "  <-- (Measures 'heavy' reuse concentration)\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "             Total Accesses:     " << c.totalAccesses
++        << "  <-- (Used to compute invariance ratio)\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "             Invariant Ratio:    " << c.invariantRatio
++        << "  <-- (Higher ratio favors OUTERMOST position)\n";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "             Invariant Weighted: " << c.invariantWeightedByDepth
++        << "\n";
++
++    // parallelism info.
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "  [Parallel] Independent:       "
++        << (c.hasDependenciesForParallelism ? "NO " : "YES")
++        << "  <-- (YES favors OUTERMOST for coarse-grain parallelism)\n";
++
++    AFFINE_LOOP_INTERCHANGE_VLOG() << "  " << std::string(50, '-') << "\n";
++  }
++
++  return scoresForEachLoopInNest;
++}
++
++// END: helpers for Loop Nest Analysis
++// :---------------------------------------------------------------------------
++
++// main pipeline for processing each root loop nest (starting from the
++// outermost loop).
++bool processTheNestAT(affine::AffineForOp root) {
++
++  // affine.if check.
++  if (hasAffineIfInLoopNest(root)) {
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "  -> Result: Has affine.if: YES, Skipping\n";
++    return false;
++  }
++
++  // structural check.
++  bool perfect = isPerfectNest(root);
++
++  // make cases depending on perfect/imperfect structure, since handling
++  // differs for both.
++
++  if (perfect) {
++    // processing on perfect nest here
++    // :---------------------------------------------------------------------------
++    AFFINE_LOOP_INTERCHANGE_VLOG() << "  -> Structure: PERFECT\n";
++    // now we apply the strict gates.
++    if (isNonRectangularLoopPERFECTNest(root)) {
++      AFFINE_LOOP_INTERCHANGE_VLOG() << "     -> NON-RECTANGULAR, Skipping\n";
++      return false;
++    }
++
++    // success: this is a perfect, rectangular, if-free nest.
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "     -> LEGAL: Ready for Cost Model & Interchange\n";
++
++    llvm::SmallVector<affine::AffineForOp, 6> perfectLoopNest;
++
++    // gives [outer to inner].
++    affine::getPerfectlyNestedLoops(perfectLoopNest, root);
++
++    if (perfectLoopNest.size() >= 2) {
++      // find all legal permutations.
++      auto legalPermutations = getAllPossibleLegalPermutations(perfectLoopNest);
++      if (legalPermutations.empty()) {
++        AFFINE_LOOP_INTERCHANGE_VLOG()
++            << "     -> No legal permutations found, Skipping\n";
++        return false;
++      }
++      // print legal permutations for debugging.
++      AFFINE_LOOP_INTERCHANGE_VLOG() << "     -> Legal Permutations:\n";
++      for (const auto &perm : legalPermutations) {
++        AFFINE_LOOP_INTERCHANGE_VLOG() << "       ";
++        for (unsigned idx : perm) {
++          AFFINE_LOOP_INTERCHANGE_VLOG() << idx << " ";
++        }
++        AFFINE_LOOP_INTERCHANGE_VLOG() << "\n";
++      }
++
++      // compute scores for the loops in the given nest.
++      SmallVector<PerLoopScoreCardForInterchange, 6> scoreCards(
++          perfectLoopNest.size());
++      for (size_t i = 0; i < perfectLoopNest.size(); ++i) {
++        scoreCards[i].loop = perfectLoopNest[i];
++      }
++      scoreCards = computeParamsForGivenLoopNest(perfectLoopNest, scoreCards);
++
++      // now pick the best permutation according to the cost model.
++      auto bestPerm =
++          findBestPermutation(perfectLoopNest, scoreCards, legalPermutations);
++      AFFINE_LOOP_INTERCHANGE_VLOG() << "     -> Best Permutation: ";
++      for (unsigned idx : bestPerm) {
++        AFFINE_LOOP_INTERCHANGE_VLOG() << idx << " ";
++      }
++
++      AFFINE_LOOP_INTERCHANGE_VLOG() << "\n";
++
++      // start actual transformation.
++      // check if the best permutation is different from identity.
++      bool isIdentity = true;
++      for (unsigned i = 0; i < bestPerm.size(); ++i) {
++        if (bestPerm[i] != i) {
++          isIdentity = false;
++          break;
++        }
++      }
++
++      if (!isIdentity) {
++        auto newRootIndex = safePermuteLoops(perfectLoopNest, bestPerm);
++        if (failed(newRootIndex)) {
++          AFFINE_LOOP_INTERCHANGE_VLOG()
++              << " -> Skipping interchange: permuteLoops preconditions "
++                 "failed.\n";
++          return false;
++        }
++
++        AFFINE_LOOP_INTERCHANGE_VLOG() << " -> Applying Interchange...\n";
++      } else {
++        AFFINE_LOOP_INTERCHANGE_VLOG()
++            << " -> No change needed (Best is already Identity).\n";
++      }
++
++      return true;
++    }
++  }
++
++  // processing an imperfect nest here.
++  AFFINE_LOOP_INTERCHANGE_VLOG() << "  -> Structure: IMPERFECT\n";
++
++  SmallVector<affine::AffineForOp, 8> distributedRoots;
++  if (distributeImperfectNestIntoSingleChildRoots(root, distributedRoots)) {
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "     -> Distributing sibling perfect loops and reprocessing...\n";
++
++    bool changed = false;
++    for (affine::AffineForOp distributedRoot : distributedRoots)
++      changed |= processTheNestAT(distributedRoot);
++    // return immediately after mutating this subtree; let the outer walker
++    // continue from the next top-level item.
++    return changed;
++  }
++
++  for (Operation &op : *root.getBody()) {
++    if (auto childLoop = dyn_cast<affine::AffineForOp>(op)) {
++      AFFINE_LOOP_INTERCHANGE_VLOG()
++          << "     -> Descending into child loop...\n";
++      // recursive call: treat the child as a potential new root.
++      processTheNestAT(childLoop);
++    }
++  }
++
++  return false;
++}
++
++struct LoopInterchangePassAffine
++    : public PassWrapper<LoopInterchangePassAffine,
++                         OperationPass<func::FuncOp>> {
++
++  StringRef getArgument() const final { return "affine-loop-interchange"; }
++
++  StringRef getDescription() const final {
++    return "Implemetation of affine-loop-interchange pass using a cost model "
++           "for compilers assignment 2a.";
++  }
++
++  void runOnOperation() override {
++
++    // get the current function being processed and print out loop information.
++    func::FuncOp f = getOperation();
++
++    AFFINE_LOOP_INTERCHANGE_VLOG() << "\n=== Function: ";
++    AFFINE_LOOP_INTERCHANGE_VLOG() << f.getName();
++    AFFINE_LOOP_INTERCHANGE_VLOG() << " ===\n";
++
++    // info for debugging.
++    // f.walk([&](affine::AffineForOp forOp) {
++    //   printSingleAffineForLoop(forOp);
++    // });
++
++    // AFFINE_LOOP_INTERCHANGE_VLOG() <<
++    // "\n----------------------------------------\n";
++
++    // high-level search for loop nests.
++    f.walk([&](affine::AffineForOp forOp) {
++      // start from outermost loops to avoid redundant analysis.
++      if (forOp->getParentOfType<affine::AffineForOp>())
++        return WalkResult::advance();
++
++      // do per-nest analysis and interchange wherever possible.
++      if (!processTheNestAT(forOp)) {
++        return WalkResult::advance();
++      }
++
++      return WalkResult::advance();
++    });
++
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "\n----------------------------------------";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "Finished processing function: " << f.getName()
++        << " end of runOnOperation";
++    AFFINE_LOOP_INTERCHANGE_VLOG()
++        << "----------------------------------------\n";
++  }
++};
++
++} // end anonymous namespace
++
++// register the pass with a unique identifier and description.
++void mlir::registerAffineLoopInterchangePass() {
++  PassRegistration<LoopInterchangePassAffine>();
++}
+diff --git a/mlir/lib/Transforms/CMakeLists.txt b/mlir/lib/Transforms/CMakeLists.txt
+index 3a8088bccf29..572841cff8d7 100644
+--- a/mlir/lib/Transforms/CMakeLists.txt
++++ b/mlir/lib/Transforms/CMakeLists.txt
+@@ -20,6 +20,7 @@ add_mlir_library(MLIRTransforms
+   SymbolPrivatize.cpp
+   TopologicalSort.cpp
+   ViewOpGraph.cpp
++  AffineLoopInterchangePassCompilersAssg.cpp   # Dev: pass implementation 
+ 
+   ADDITIONAL_HEADER_DIRS
+   ${MLIR_MAIN_INCLUDE_DIR}/mlir/Transforms
+@@ -29,6 +30,8 @@ add_mlir_library(MLIRTransforms
+ 
+   LINK_LIBS PUBLIC
+   MLIRAnalysis
++  MLIRAffineDialect      
++  MLIRFuncDialect
+   MLIRFunctionInterfaces
+   MLIRLoopLikeInterface
+   MLIRMemorySlotInterfaces
+-- 
+2.45.2
+
